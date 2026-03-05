@@ -7,10 +7,10 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-INDEX_DIR = "/index"
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+INDEX_DIR = os.getenv("INDEX_DIR", "/tmp/index")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 
 EMB_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 DIM = 384
@@ -211,6 +211,11 @@ ANSWER:""".strip()
         )
         r.raise_for_status()
         return r.json()["response"].strip()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/reindex")
