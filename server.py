@@ -1,6 +1,9 @@
-import os, json, glob, csv, re, requests
+import os, json, glob, csv, re, requests, threading, time, uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
 import faiss
 import numpy as np
@@ -11,6 +14,8 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/uploads")
 INDEX_DIR  = os.getenv("INDEX_DIR",  "/tmp/index")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 MODEL      = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+OLLAMA_EXTRACT_TIMEOUT = int(os.getenv("OLLAMA_EXTRACT_TIMEOUT", "120"))
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".csv", ".json"}
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -21,8 +26,17 @@ DIM = 384
 # In-memory cache — populated on first request
 _index: Optional[faiss.Index] = None
 _meta: Optional[List[Dict]] = None
+_index_lock = threading.RLock()
+
+# Background job tracking
+_job_lock = threading.Lock()
+_jobs: Dict[str, Dict] = {}
+_executor = ThreadPoolExecutor(max_workers=int(os.getenv("WORKER_THREADS", "4")))
 
 app = FastAPI()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "app", "static")
 
 # ── Internal data schemas ─────────────────────────────────────────────────────
 #
@@ -83,7 +97,7 @@ TEXT:
 JSON:"""
 
 
-def _call_ollama_generate(prompt: str, timeout: int = 120) -> str:
+def _call_ollama_generate(prompt: str, timeout: int = OLLAMA_EXTRACT_TIMEOUT) -> str:
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
         json={"model": MODEL, "prompt": prompt, "stream": False},
@@ -100,7 +114,7 @@ def extract_structure(raw_text: str, filename: str) -> Optional[Dict]:
     """
     prompt = EXTRACTION_PROMPT.format(text=raw_text[:4000])
     try:
-        response = _call_ollama_generate(prompt)
+        response = _call_ollama_generate(prompt, timeout=OLLAMA_EXTRACT_TIMEOUT)
         # Strip markdown fences if the model added them anyway
         response = re.sub(r"```(?:json)?", "", response).strip().rstrip("`")
         # Find the outermost JSON object
@@ -377,7 +391,7 @@ def load_meta() -> List[Dict]:
         return json.load(f)
 
 
-def build_index():
+def build_index_data():
     paths = index_paths()
     vectors, meta = [], []
     for p in paths:
@@ -392,34 +406,46 @@ def build_index():
     idx = faiss.IndexFlatIP(DIM)
     faiss.normalize_L2(X)
     idx.add(X)
+    return idx, meta
+
+
+def persist_index(idx: faiss.Index, meta: List[Dict]) -> None:
     os.makedirs(INDEX_DIR, exist_ok=True)
     faiss.write_index(idx, os.path.join(INDEX_DIR, "faiss.index"))
     save_meta(meta)
 
 
+def build_index():
+    idx, meta = build_index_data()
+    persist_index(idx, meta)
+    return idx, meta
+
+
 def load_index():
     idx_path = os.path.join(INDEX_DIR, "faiss.index")
     if not os.path.exists(idx_path):
-        build_index()
+        idx, meta = build_index()
+        return idx, meta
     return faiss.read_index(idx_path), load_meta()
 
 
 def retrieve(query: str, k: int = 8):
     global _index, _meta
-    if _index is None or _meta is None:
-        _index, _meta = load_index()
+    with _index_lock:
+        if _index is None or _meta is None:
+            _index, _meta = load_index()
+        idx, meta = _index, _meta
     q = EMB_MODEL.encode(query).astype("float32")[None, :]
     faiss.normalize_L2(q)
-    scores, ids = _index.search(q, k)
-    return [(float(s), _meta[i]) for s, i in zip(scores[0], ids[0]) if i != -1]
+    scores, ids = idx.search(q, k)
+    return [(float(s), meta[i]) for s, i in zip(scores[0], ids[0]) if i != -1]
 
 
 # ── LLM answer generation ─────────────────────────────────────────────────────
 
-def ollama_answer(question: str, contexts: List[Dict]) -> str:
+def _build_answer_prompt(question: str, contexts: List[Dict]) -> str:
     ctx = "\n\n".join(c["text"] for c in contexts)
-
-    prompt = f"""You are a friendly and knowledgeable trekking assistant. Answer the question below using only the data provided.
+    return f"""You are a friendly and knowledgeable trekking assistant. Answer the question below using only the data provided.
 
 Guidelines:
 - Write in clear, natural sentences — never output raw CSV values or comma-separated lists.
@@ -435,11 +461,14 @@ QUESTION: {question}
 
 ANSWER:""".strip()
 
+
+def ollama_answer(question: str, contexts: List[Dict]) -> str:
+    prompt = _build_answer_prompt(question, contexts)
     try:
         r = requests.post(
             f"{OLLAMA_URL}/api/chat",
             json={"model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False},
-            timeout=120,
+            timeout=OLLAMA_TIMEOUT,
         )
         if r.status_code == 404:
             raise requests.HTTPError("chat endpoint not found", response=r)
@@ -449,10 +478,67 @@ ANSWER:""".strip()
         r = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={"model": MODEL, "prompt": prompt, "stream": False},
-            timeout=120,
+            timeout=OLLAMA_TIMEOUT,
         )
         r.raise_for_status()
         return r.json()["response"].strip()
+    except requests.RequestException:
+        return "The language model is taking too long to respond. Please try again in a moment."
+
+
+def ollama_stream(question: str, contexts: List[Dict]):
+    """Generator that yields SSE events with tokens streamed from Ollama."""
+    prompt = _build_answer_prompt(question, contexts)
+
+    def _try_chat_stream():
+        r = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={"model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": True},
+            stream=True,
+            timeout=OLLAMA_TIMEOUT,
+        )
+        if r.status_code == 404:
+            raise requests.HTTPError("chat endpoint not found", response=r)
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            chunk = json.loads(line)
+            token = chunk.get("message", {}).get("content", "")
+            if token:
+                yield token
+            if chunk.get("done"):
+                break
+
+    def _try_generate_stream():
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": MODEL, "prompt": prompt, "stream": True},
+            stream=True,
+            timeout=OLLAMA_TIMEOUT,
+        )
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            chunk = json.loads(line)
+            token = chunk.get("response", "")
+            if token:
+                yield token
+            if chunk.get("done"):
+                break
+
+    try:
+        try:
+            for token in _try_chat_stream():
+                yield f"data: {json.dumps({'token': token})}\n\n"
+        except requests.HTTPError:
+            for token in _try_generate_stream():
+                yield f"data: {json.dumps({'token': token})}\n\n"
+    except requests.RequestException as e:
+        yield f"data: {json.dumps({'error': 'Model is not responding. Please try again.'})}\n\n"
+
+    yield "data: [DONE]\n\n"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -462,7 +548,106 @@ def safe_filename(name: str) -> str:
     return re.sub(r"[^\w.\-]", "_", name)
 
 
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _create_job(kind: str, payload: Optional[Dict] = None) -> str:
+    job_id = uuid.uuid4().hex
+    with _job_lock:
+        _jobs[job_id] = {
+            "id": job_id,
+            "kind": kind,
+            "status": "queued",
+            "queued_at": _now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "payload": payload or {},
+        }
+        # keep the last 200 jobs to avoid unbounded growth
+        if len(_jobs) > 200:
+            for jid in list(_jobs.keys())[:-200]:
+                _jobs.pop(jid, None)
+    return job_id
+
+
+def _update_job(job_id: str, **fields) -> None:
+    with _job_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(fields)
+
+
+def _run_reindex_job(job_id: str) -> None:
+    _update_job(job_id, status="running", started_at=_now_iso())
+    try:
+        idx, meta = build_index_data()
+        persist_index(idx, meta)
+        with _index_lock:
+            global _index, _meta
+            _index, _meta = idx, meta
+        _update_job(job_id, status="done", finished_at=_now_iso())
+    except Exception as exc:
+        _update_job(job_id, status="failed", finished_at=_now_iso(), error=str(exc))
+
+
+def _run_upload_job(job_id: str, paths: List[str]) -> None:
+    _update_job(job_id, status="running", started_at=_now_iso())
+    processed = []
+    try:
+        for dest in paths:
+            try:
+                text = read_file(dest)
+                structured = extract_structure(text, os.path.basename(dest))
+                if structured:
+                    struct_path = dest + ".structured.json"
+                    with open(struct_path, "w", encoding="utf-8") as f:
+                        json.dump(structured, f, ensure_ascii=False, indent=2)
+                    processed.append({
+                        "file": os.path.basename(dest),
+                        "category": structured["category"],
+                        "entries_extracted": len(structured["entries"]),
+                        "indexed_from": "structured",
+                    })
+                else:
+                    processed.append({
+                        "file": os.path.basename(dest),
+                        "category": "raw",
+                        "entries_extracted": None,
+                        "indexed_from": "raw",
+                    })
+            except Exception as exc:
+                processed.append({
+                    "file": os.path.basename(dest),
+                    "category": "error",
+                    "entries_extracted": None,
+                    "indexed_from": "raw",
+                    "error": str(exc),
+                })
+
+        idx, meta = build_index_data()
+        persist_index(idx, meta)
+        with _index_lock:
+            global _index, _meta
+            _index, _meta = idx, meta
+        _update_job(job_id, status="done", finished_at=_now_iso(), result=processed)
+    except Exception as exc:
+        _update_job(job_id, status="failed", finished_at=_now_iso(), error=str(exc), result=processed)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+def root():
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"status": "ok", "message": "UI not built. Place files in app/static."}
+
 
 @app.get("/health")
 def health():
@@ -494,7 +679,7 @@ def list_files():
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    results = []
+    saved_paths = []
 
     for file in files:
         ext = os.path.splitext(file.filename or "")[1].lower()
@@ -511,44 +696,35 @@ async def upload(files: List[UploadFile] = File(...)):
         dest = os.path.join(UPLOAD_DIR, safe_filename(file.filename or "upload"))
         with open(dest, "wb") as f:
             f.write(content)
+        saved_paths.append(dest)
 
-        # Run AI extraction
-        raw_text = content.decode("utf-8", errors="ignore")
-        structured = extract_structure(raw_text, os.path.basename(dest))
-
-        if structured:
-            struct_path = dest + ".structured.json"
-            with open(struct_path, "w", encoding="utf-8") as f:
-                json.dump(structured, f, ensure_ascii=False, indent=2)
-            results.append({
-                "file": os.path.basename(dest),
-                "category": structured["category"],
-                "entries_extracted": len(structured["entries"]),
-                "indexed_from": "structured",
-            })
-        else:
-            # Extraction failed — index the raw file as fallback
-            results.append({
-                "file": os.path.basename(dest),
-                "category": "raw",
-                "entries_extracted": None,
-                "indexed_from": "raw",
-            })
-
-    # Rebuild index with new data
-    global _index, _meta
-    build_index()
-    _index, _meta = load_index()
-
-    return {"uploaded": results}
+    job_id = _create_job("upload", {"files": [os.path.basename(p) for p in saved_paths]})
+    _executor.submit(_run_upload_job, job_id, saved_paths)
+    return {"status": "queued", "job_id": job_id, "files": [os.path.basename(p) for p in saved_paths]}
 
 
 @app.post("/reindex")
 def reindex():
-    global _index, _meta
-    build_index()
-    _index, _meta = load_index()
-    return {"status": "ok"}
+    job_id = _create_job("reindex")
+    _executor.submit(_run_reindex_job, job_id)
+    return {"status": "queued", "job_id": job_id}
+
+
+@app.get("/jobs")
+def list_jobs():
+    with _job_lock:
+        jobs = list(_jobs.values())
+    jobs.sort(key=lambda j: j.get("queued_at") or "", reverse=True)
+    return {"jobs": jobs[:50]}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    with _job_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.get("/ask")
@@ -558,3 +734,20 @@ def ask(q: str):
     if not strong:
         return {"answer": "I don't have that information in the current dataset."}
     return {"answer": ollama_answer(q, strong[:6])}
+
+
+@app.get("/ask/stream")
+def ask_stream(q: str):
+    """SSE endpoint — tokens arrive as they are generated by Ollama."""
+    hits = retrieve(q, k=8)
+    strong = [m for s, m in hits if s >= 0.10]
+    if not strong:
+        def _no_data():
+            yield f"data: {json.dumps({'token': 'I don' + chr(39) + 't have that information in the current dataset.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_no_data(), media_type="text/event-stream")
+    return StreamingResponse(
+        ollama_stream(q, strong[:6]),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
