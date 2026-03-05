@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+index/faiss.index
+index/meta.json
+.env

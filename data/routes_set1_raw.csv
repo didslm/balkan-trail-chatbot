@@ -1,0 +1,12 @@
+Stage,Route,Distance_mi,Distance_km,Gain_ft,Gain_m,Loss_ft,Loss_m,Confidence
+1,"Theth (AL) → Valbona (AL)",8.64,13.9,3504,1068,2598,792,High
+2,"Valbona (AL) → Çerem (AL)",9.38,15.1,3888,1185,3330,1015,High
+3,"Çerem (AL) → Dobërdol (AL)",9.69,15.6,3379,1030,1444,440,High
+4,"Dobërdol (AL) → Milishevc (RKS)",11.31,18.2,3002,915,"3215-4100","980-1250",Medium
+5,"Milishevc (RKS) → Rekë e Allagës (RKS)",10.00,16.1,2822,860,"4190-4757","1277-1450",High
+6,"Rekë e Allagës (RKS) → Kuqishtë (RKS)",14.35,23.1,"3773-4100","1150-1250",3609,1100,Low
+7,"Kuqishtë (RKS) → Babino Polje (MNE)",9.82,15.8,3773,1150,3609,1100,Medium
+8,"Babino Polje (MNE) → Plav (MNE)",12.61,20.3,2362,720,4101,1250,High
+9,"Plav (MNE) → Vusanje (MNE)",17.03,27.4,"3609-4100","1100-1250","3280-3609","1000-1100",Medium
+10,"Vusanje (MNE) → Theth (AL)",13.24,21.3,3609,1100,4593,1400,High
+Total,"",106.69,171.7,"34,131","10,403","34,862","10,626",""

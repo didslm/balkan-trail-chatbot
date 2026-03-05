@@ -1,0 +1,23 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
+  rag-api:
+    image: python:3.11-slim
+    environment:
+      - OLLAMA_MODEL=llama3.2:1b
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - ./data:/data:ro          # your trail files live here
+      - ./index:/index           # persisted vector index
+    command: bash -lc "pip install -r requirements.txt && uvicorn server:app --host 0.0.0.0 --port 8000"
+    ports: ["8000:8000"]
+    depends_on: [ollama]
+
+volumes:
+  ollama:

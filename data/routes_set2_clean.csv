@@ -1,0 +1,9 @@
+set,stage,route,distance_mi,distance_km,confidence,gain_ft_min,gain_ft_max,gain_ft_avg,gain_m_min,gain_m_max,gain_m_avg,loss_ft_min,loss_ft_max,loss_ft_avg,loss_m_min,loss_m_max,loss_m_avg
+2,1,Theth (AL) → Valbona (AL),8.64,13.9,High,3504,3504,3504,1068,1068,1068,2598,2598,2598,792,792,792
+2,2,Valbona (AL) → Çerem (AL),9.38,15.1,High,3888,3888,3888,1185,1185,1185,3330,3330,3330,1015,1015,1015
+2,3,Çerem (AL) → Milishevc (XK),21.00,33.8,Medium-High,6381,6381,6381,1945,1945,1945,3658,3658,3658,1115,1115,1115
+2,4,Milishevc (XK) → Babino Polje (MNE),9.69,15.6,Medium-High,2690,2690,2690,820,820,820,3445,3445,3445,1050,1050,1050
+2,5,Babino Polje (MNE) → Plav (MNE),12.61,20.3,High,2362,2362,2362,720,720,720,4101,4101,4101,1250,1250,1250
+2,6,Plav (MNE) → Vusanje (MNE),17.03,27.4,Medium,3609,4100,3854.5,1100,1250,1175,3280,3609,3444.5,1000,1100,1050
+2,7,Vusanje (MNE) → Theth (AL),13.24,21.3,High,3609,3609,3609,1100,1100,1100,4593,4593,4593,1400,1400,1400
+2,Total,,72.51,116.7,,30144,30144,30144,9188,9188,9188,25171,25171,25171,7672,7672,7672
