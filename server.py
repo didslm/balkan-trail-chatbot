@@ -1,6 +1,5 @@
 import os, json, glob, csv, requests
 from typing import List, Dict, Optional
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pypdf import PdfReader
 import faiss
@@ -15,19 +14,11 @@ MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 EMB_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 DIM = 384
 
-# In-memory cache — loaded once at startup
+# In-memory cache — populated on first request
 _index: Optional[faiss.Index] = None
 _meta: Optional[List[Dict]] = None
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _index, _meta
-    _index, _meta = load_index()
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 
 def read_file(path: str) -> str:
