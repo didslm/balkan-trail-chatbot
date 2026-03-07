@@ -10,6 +10,10 @@ ENV SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Bake the embedding model into the image — cache is pinned to /app/.cache
+# above so it is always found at runtime regardless of Railway's HOME/user.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
 COPY . .
 
 EXPOSE 8000

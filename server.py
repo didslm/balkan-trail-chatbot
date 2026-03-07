@@ -1,4 +1,5 @@
-import os, json, glob, csv, re, requests, threading, time, uuid, hashlib
+import os, json, glob, csv, re, threading, time, uuid, hashlib
+import anthropic
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -12,12 +13,12 @@ from sentence_transformers import SentenceTransformer
 DATA_DIR   = os.getenv("DATA_DIR",   "/app/data")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/uploads")
 INDEX_DIR  = os.getenv("INDEX_DIR",  "/tmp/index")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-MODEL      = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
-OLLAMA_EXTRACT_TIMEOUT = int(os.getenv("OLLAMA_EXTRACT_TIMEOUT", "120"))
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+EMBED_MODEL_NAME  = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_DIM         = int(os.getenv("EMBED_DIM", "384"))
+
+_claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".csv", ".json"}
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -137,27 +138,21 @@ TEXT:
 JSON:"""
 
 
-def _call_ollama_generate(prompt: str, timeout: int = OLLAMA_EXTRACT_TIMEOUT) -> str:
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": MODEL, "prompt": prompt, "stream": False},
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    return r.json()["response"].strip()
-
-
 def extract_structure(raw_text: str, filename: str) -> Optional[Dict]:
     """
-    Send raw text to Ollama and get back a validated structured dict.
+    Ask Claude to extract structured data from raw text.
     Returns None if extraction fails so the caller can fall back to raw indexing.
     """
-    prompt = EXTRACTION_PROMPT.format(text=raw_text[:4000])
+    prompt = EXTRACTION_PROMPT.format(text=raw_text[:6000])
     try:
-        response = _call_ollama_generate(prompt, timeout=OLLAMA_EXTRACT_TIMEOUT)
-        # Strip markdown fences if the model added them anyway
+        msg = _claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            system="You are a precise data extraction assistant. Return only valid JSON, no explanation.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response = msg.content[0].text.strip()
         response = re.sub(r"```(?:json)?", "", response).strip().rstrip("`")
-        # Find the outermost JSON object
         match = re.search(r"\{[\s\S]*\}", response)
         if not match:
             return None
@@ -481,103 +476,48 @@ def retrieve(query: str, k: int = 8):
     return [(float(s), meta[i]) for s, i in zip(scores[0], ids[0]) if i != -1]
 
 
-# ── LLM answer generation ─────────────────────────────────────────────────────
+# ── LLM answer generation (Claude) ───────────────────────────────────────────
 
-def _build_answer_prompt(question: str, contexts: List[Dict]) -> str:
+SYSTEM_PROMPT = """You are a friendly and knowledgeable trekking assistant for the Balkans.
+Answer using ONLY the data provided in the user message.
+- Write in clear, natural sentences — never output raw CSV or comma-separated lists.
+- Always include numbers with their units (km, mi, m, ft, price).
+- When comparing (e.g. "easiest", "longest"), state the winner and briefly explain why.
+- Keep answers concise: 1–4 sentences.
+- If the answer is not in the data, say: "I don't have that information in the current dataset.\""""
+
+
+def _user_message(question: str, contexts: List[Dict]) -> str:
     ctx = "\n\n".join(c["text"] for c in contexts)
-    return f"""You are a friendly and knowledgeable trekking assistant. Answer the question below using only the data provided.
-
-Guidelines:
-- Write in clear, natural sentences — never output raw CSV values or comma-separated lists.
-- Always include relevant numbers with their units (km, mi, meters, feet, price).
-- When comparing stages (e.g. "easiest", "longest"), look at the relevant fields, state the winner, and briefly explain why.
-- Keep your answer concise: 1–4 sentences is ideal.
-- If the data does not contain the answer, say: "I don't have that information in the current dataset."
-
-DATA:
-{ctx}
-
-QUESTION: {question}
-
-ANSWER:""".strip()
+    return f"DATA:\n{ctx}\n\nQUESTION: {question}"
 
 
-def ollama_answer(question: str, contexts: List[Dict]) -> str:
-    prompt = _build_answer_prompt(question, contexts)
+def claude_answer(question: str, contexts: List[Dict]) -> str:
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False},
-            timeout=OLLAMA_TIMEOUT,
+        msg = _claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=512,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _user_message(question, contexts)}],
         )
-        if r.status_code == 404:
-            raise requests.HTTPError("chat endpoint not found", response=r)
-        r.raise_for_status()
-        return r.json()["message"]["content"].strip()
-    except requests.HTTPError:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": MODEL, "prompt": prompt, "stream": False},
-            timeout=OLLAMA_TIMEOUT,
-        )
-        r.raise_for_status()
-        return r.json()["response"].strip()
-    except requests.RequestException:
-        return "The language model is taking too long to respond. Please try again in a moment."
+        return msg.content[0].text.strip()
+    except anthropic.APIError as e:
+        return f"Sorry, the AI service returned an error: {e}"
 
 
-def ollama_stream(question: str, contexts: List[Dict]):
-    """Generator that yields SSE events with tokens streamed from Ollama."""
-    prompt = _build_answer_prompt(question, contexts)
-
-    def _try_chat_stream():
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": True},
-            stream=True,
-            timeout=OLLAMA_TIMEOUT,
-        )
-        if r.status_code == 404:
-            raise requests.HTTPError("chat endpoint not found", response=r)
-        r.raise_for_status()
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            chunk = json.loads(line)
-            token = chunk.get("message", {}).get("content", "")
-            if token:
-                yield token
-            if chunk.get("done"):
-                break
-
-    def _try_generate_stream():
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": MODEL, "prompt": prompt, "stream": True},
-            stream=True,
-            timeout=OLLAMA_TIMEOUT,
-        )
-        r.raise_for_status()
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            chunk = json.loads(line)
-            token = chunk.get("response", "")
-            if token:
-                yield token
-            if chunk.get("done"):
-                break
-
+def claude_stream(question: str, contexts: List[Dict]):
+    """Generator that yields SSE events with tokens streamed from Claude."""
     try:
-        try:
-            for token in _try_chat_stream():
-                yield f"data: {json.dumps({'token': token})}\n\n"
-        except requests.HTTPError:
-            for token in _try_generate_stream():
-                yield f"data: {json.dumps({'token': token})}\n\n"
-    except requests.RequestException as e:
-        yield f"data: {json.dumps({'error': 'Model is not responding. Please try again.'})}\n\n"
-
+        with _claude.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=512,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _user_message(question, contexts)}],
+        ) as stream:
+            for text in stream.text_stream:
+                yield f"data: {json.dumps({'token': text})}\n\n"
+    except anthropic.APIError as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -773,12 +713,12 @@ def ask(q: str):
     strong = [m for s, m in hits if s >= 0.10]
     if not strong:
         return {"answer": "I don't have that information in the current dataset."}
-    return {"answer": ollama_answer(q, strong[:6])}
+    return {"answer": claude_answer(q, strong[:6])}
 
 
 @app.get("/ask/stream")
 def ask_stream(q: str):
-    """SSE endpoint — tokens arrive as they are generated by Ollama."""
+    """SSE endpoint — tokens arrive as Claude generates them."""
     hits = retrieve(q, k=8)
     strong = [m for s, m in hits if s >= 0.10]
     if not strong:
@@ -787,7 +727,7 @@ def ask_stream(q: str):
             yield "data: [DONE]\n\n"
         return StreamingResponse(_no_data(), media_type="text/event-stream")
     return StreamingResponse(
-        ollama_stream(q, strong[:6]),
+        claude_stream(q, strong[:6]),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
