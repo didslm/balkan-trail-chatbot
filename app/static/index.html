@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trek Data Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="kicker">Trekking Knowledge Base</p>
+          <h1>Trek Data Console</h1>
+          <p class="lead">
+            Ask questions, upload sources, and keep the index fresh. Everything runs against the
+            local API.
+          </p>
+        </div>
+        <div class="status" id="health">
+          <span class="dot"></span>
+          <div>
+            <p class="label">API status</p>
+            <p class="value">Checking...</p>
+          </div>
+        </div>
+      </header>
+
+      <section class="grid">
+        <div class="card">
+          <h2>Ask the dataset</h2>
+          <p>Type a question and get a concise answer grounded in the indexed data.</p>
+          <div class="row">
+            <input id="question" type="text" placeholder="e.g. Which stage has the biggest elevation gain?" />
+            <button id="askBtn">Ask</button>
+          </div>
+          <div class="output" id="answer">Answer will appear here.</div>
+        </div>
+
+        <div class="card">
+          <h2>Upload documents</h2>
+          <p>Add PDFs, CSVs, JSON, TXT, or Markdown files. New uploads are indexed automatically.</p>
+          <div class="row">
+            <input id="fileInput" type="file" multiple />
+            <button id="uploadBtn">Upload</button>
+          </div>
+          <div class="output" id="uploadResult">No uploads yet.</div>
+        </div>
+
+        <div class="card">
+          <h2>Files in upload queue</h2>
+          <p>See what has already been processed and how it was categorized.</p>
+          <div class="row">
+            <button id="refreshFiles">Refresh list</button>
+            <button class="ghost" id="reindexBtn">Reindex all</button>
+          </div>
+          <div class="output" id="fileList">No files loaded.</div>
+        </div>
+
+        <div class="card highlight">
+          <h2>Quick tips</h2>
+          <p>
+            Keep questions short. The assistant responds best to clear comparisons or factual lookups.
+            If an answer is missing, upload more sources.
+          </p>
+          <ul class="tips">
+            <li>Use concrete locations or stage names</li>
+            <li>Upload structured JSON to preserve detail</li>
+            <li>Reindex after big data changes</li>
+          </ul>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

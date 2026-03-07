@@ -1,4 +1,4 @@
-import os, json, glob, csv, re, requests, threading, time, uuid
+import os, json, glob, csv, re, requests, threading, time, uuid, hashlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -16,12 +16,52 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 MODEL      = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 OLLAMA_EXTRACT_TIMEOUT = int(os.getenv("OLLAMA_EXTRACT_TIMEOUT", "120"))
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".csv", ".json"}
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 
-EMB_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-DIM = 384
+class HashEmbeddingModel:
+    """
+    Deterministic, dependency-free fallback when SentenceTransformer cannot load.
+    Keeps the API available in offline/no-egress environments.
+    """
+    def __init__(self, dim: int = 384):
+        self.dim = dim
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self.dim
+
+    def _encode_one(self, text: str) -> np.ndarray:
+        vec = np.zeros(self.dim, dtype="float32")
+        for token in re.findall(r"\w+", (text or "").lower()):
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % self.dim
+            sign = 1.0 if (digest[4] & 1) else -1.0
+            vec[idx] += sign
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+
+    def encode(self, text):
+        if isinstance(text, str):
+            return self._encode_one(text)
+        return np.array([self._encode_one(t) for t in text], dtype="float32")
+
+
+def _init_embedding_model():
+    try:
+        return SentenceTransformer(EMBED_MODEL_NAME)
+    except Exception as exc:
+        print(f"[warn] Embedding model '{EMBED_MODEL_NAME}' unavailable: {exc}")
+        print(f"[warn] Falling back to hash embeddings (dim={EMBED_DIM}).")
+        return HashEmbeddingModel(dim=EMBED_DIM)
+
+
+EMB_MODEL = _init_embedding_model()
+DIM = int(getattr(EMB_MODEL, "get_sentence_embedding_dimension", lambda: EMBED_DIM)())
 
 # In-memory cache — populated on first request
 _index: Optional[faiss.Index] = None
